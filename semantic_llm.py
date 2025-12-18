@@ -7,10 +7,26 @@ from typing import Dict, Any
 from dotenv import load_dotenv
 from openai import OpenAI
 
-load_dotenv()
-client = OpenAI() 
+import streamlit as st
 
 MODEL_NAME = "gpt-4.1-mini"
+
+def _get_openai_client() -> OpenAI:
+    api_key = None
+
+    # Streamlit Cloud
+    if hasattr(st, "secrets") and "OPENAI_API_KEY" in st.secrets:
+        api_key = st.secrets["OPENAI_API_KEY"]
+    else:
+        api_key = os.getenv("OPENAI_API_KEY")
+
+    if not api_key:
+        raise RuntimeError(
+            "OPENAI_API_KEY not found. "
+            "Set it in Streamlit Secrets or environment variables."
+        )
+
+    return OpenAI(api_key=api_key)
 
 
 def _safe_json_from_text(text: str) -> Dict[str, Any]:
