@@ -1,152 +1,191 @@
-# evaluation.py
-from typing import List, Dict, Any
-
-import numpy as np
 import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.metrics import confusion_matrix, accuracy_score, precision_score, recall_score
 
-from data_loader import load_trials, build_full_text
-from tfidf_model import TFIDFModel
-from hybrid_model import HybridModel
+# ==========================================
+# 1. Experimental Data Design (10 Trials, 5 Patients)
+# ==========================================
 
-
-# -----------------------------
-# Define patient-trial relevance rules
-# -----------------------------
-def trial_relevant_for_patient(patient: Dict[str, Any], row: pd.Series) -> bool:
-    age = patient.get("age")
-    cond_keywords = [c.lower() for c in (patient.get("conditions") or []) if c]
-
-    # Condition 1: at least one condition keyword matches trial conditions
-    trial_conds = str(row.get("conditions", "")).lower()
-    if cond_keywords:
-        if not any(k in trial_conds for k in cond_keywords):
-            return False
-
-    # Condition 2: age compatible (if trial has age limits)
-    if age is not None:
-        min_age = row.get("minAgeYears", np.nan)
-        max_age = row.get("maxAgeYears", np.nan)
-
-        if not np.isnan(min_age) and age < min_age:
-            return False
-        if not np.isnan(max_age) and age > max_age:
-            return False
-
-    return True
-
-
-# -----------------------------
-# Few synthetic patient cases
-# -----------------------------
-def build_synthetic_patients() -> List[Dict[str, Any]]:
+trials_data = [
+    # --- Diabetes Group (Trap: Age) ---
+    {"id": "T1", "text": "Type 2 Diabetes Study for Adults", "cond": "Diabetes", "minAge": 18, "maxAge": 65, "sex": "ALL"},
+    {"id": "T2", "text": "Pediatric Diabetes Insulin Study", "cond": "Diabetes", "minAge": 0,  "maxAge": 17, "sex": "ALL"},
     
-    patients = [
-        {
-            "name": "Case 1: T2D middle-aged male",
-            "age": 60,
-            "sex": "MALE",
-            "conditions": ["type 2 diabetes"],
-            "keywords": ["diabetes", "hyperglycemia"],
-            "query_text": "60 year old male with type 2 diabetes and high blood sugar",
-        },
-        {
-            "name": "Case 2: Breast cancer female",
-            "age": 52,
-            "sex": "FEMALE",
-            "conditions": ["breast cancer"],
-            "keywords": ["breast tumor", "HER2"],
-            "query_text": "52 year old female with breast cancer",
-        },
-        {
-            "name": "Case 3: Chronic kidney disease",
-            "age": 70,
-            "sex": "MALE",
-            "conditions": ["chronic kidney disease"],
-            "keywords": ["CKD", "renal failure"],
-            "query_text": "70 year old male with chronic kidney disease stage 3",
-        },
-    ]
-    return patients
+    # --- Hypertension Group (Trap: Sex & Age) ---
+    {"id": "T3", "text": "Hypertension Study for Senior Males", "cond": "Hypertension", "minAge": 65, "maxAge": 100, "sex": "MALE"},
+    {"id": "T4", "text": "General Hypertension Medication Study", "cond": "Hypertension", "minAge": 18, "maxAge": 80, "sex": "ALL"},
+    
+    # --- Breast Cancer Group (Trap: Sex) ---
+    {"id": "T5", "text": "Breast Cancer Treatment for Women", "cond": "Breast Cancer", "minAge": 18, "maxAge": 99, "sex": "FEMALE"},
+    {"id": "T6", "text": "Rare Male Breast Cancer Study", "cond": "Breast Cancer", "minAge": 18, "maxAge": 99, "sex": "MALE"},
+    
+    # --- Asthma Group (Trap: None, General) ---
+    {"id": "T7", "text": "Asthma Relief for All Ages", "cond": "Asthma", "minAge": 0, "maxAge": 99, "sex": "ALL"},
+    
+    # --- Distractors (Irrelevant) ---
+    {"id": "T8", "text": "Healthy Volunteer Flu Vaccine", "cond": "Flu", "minAge": 18, "maxAge": 60, "sex": "ALL"},
+    {"id": "T9", "text": "Kidney Failure Dialysis Study", "cond": "Kidney Disease", "minAge": 40, "maxAge": 80, "sex": "ALL"},
+    {"id": "T10", "text": "Migraine Headache Study", "cond": "Migraine", "minAge": 18, "maxAge": 50, "sex": "ALL"},
+]
 
+df_trials = pd.DataFrame(trials_data)
+# Concatenate text for TF-IDF
+df_trials["fullText"] = df_trials["text"] + " " + df_trials["cond"]
 
-# -----------------------------
-# Simple Precision@K evaluation
-# -----------------------------
-def precision_at_k(
-    ranked_indices: List[int],
-    df: pd.DataFrame,
-    patient: Dict[str, Any],
-    k: int,
-) -> float:
-    top_idx = ranked_indices[:k]
-    if not top_idx:
-        return 0.0
+# 5 Synthetic Patients
+patients_data = [
+    {"id": "P1", "desc": "Child (10yo) with Diabetes", "age": 10, "sex": "MALE", "cond": "Diabetes"},
+    {"id": "P2", "desc": "Adult (40yo) Male with Hypertension", "age": 40, "sex": "MALE", "cond": "Hypertension"},
+    {"id": "P3", "desc": "Male with Breast Cancer", "age": 55, "sex": "MALE", "cond": "Breast Cancer"},
+    {"id": "P4", "desc": "Senior (70yo) Female with Hypertension", "age": 70, "sex": "FEMALE", "cond": "Hypertension"},
+    {"id": "P5", "desc": "Adult (30yo) with Asthma", "age": 30, "sex": "FEMALE", "cond": "Asthma"},
+]
 
-    relevant_count = 0
-    for idx in top_idx:
-        row = df.iloc[idx]
-        if trial_relevant_for_patient(patient, row):
-            relevant_count += 1
+# ==========================================
+# 2. Ground Truth Identification
+# ==========================================
 
-    return relevant_count / len(top_idx)
+def get_ground_truth(patient, trial):
+    # 1. Condition must match
+    if patient["cond"] != trial["cond"]: return 0
+    # 2. Age must be within range
+    if patient["age"] < trial["minAge"] or patient["age"] > trial["maxAge"]: return 0
+    # 3. Sex must match
+    if trial["sex"] != "ALL" and trial["sex"] != patient["sex"]: return 0
+    
+    return 1 # Match
 
+# Build Ground Truth Matrix
+ground_truth_matrix = np.zeros((len(patients_data), len(trials_data)))
 
-def run_evaluation(
-    csv_path: str = "data/compact_trials_small.csv",
-    top_k: int = 5,
-    candidate_k: int = 50,
-):
-    # 1. read data + build fullText
-    df = load_trials(csv_path)
-    df = build_full_text(df)
+print("=== 1. Pre-defined Ground Truth ===")
+print("1 = Should Recommend, 0 = Should Not Recommend\n")
+header = [t["id"] for t in trials_data]
+print(f"{'Patient':<35} | " + "  ".join(header))
+print("-" * 80)
 
-    print(f"[INFO] Loaded {len(df)} trials from {csv_path}")
+truth_flat = [] 
+for i, p in enumerate(patients_data):
+    row_vals = []
+    for j, t in enumerate(trials_data):
+        is_match = get_ground_truth(p, t)
+        ground_truth_matrix[i, j] = is_match
+        row_vals.append(str(int(is_match)))
+        truth_flat.append(is_match)
+    print(f"{p['desc']:<35} | " + "   ".join(row_vals))
 
-    # 2. TF-IDF baseline + Hybrid model
-    tfidf = TFIDFModel(df)
-    tfidf.fit()
-    hybrid = HybridModel(tfidf, alpha=0.7, beta=0.3)
+# ==========================================
+# 3. Model Definitions
+# ==========================================
 
-    # 3. Build synthetic patients
-    patients = build_synthetic_patients()
+class SimpleTFIDF:
+    def __init__(self, df):
+        self.df = df
+        self.vec = TfidfVectorizer(stop_words='english')
+        self.mx = self.vec.fit_transform(df["fullText"])
+        
+    def predict(self, query_text, top_k=3):
+        q = self.vec.transform([query_text])
+        sim = cosine_similarity(q, self.mx).flatten()
+        top_idx = np.argsort(sim)[::-1][:top_k]
+        return top_idx
 
-    # 4. Compare patient cases baseline vs hybrid
-    baseline_scores = []
-    hybrid_scores = []
+class SimpleHybrid:
+    def __init__(self, df, tfidf_model):
+        self.df = df
+        self.tfidf = tfidf_model
+        
+    def predict(self, patient, top_k=3):
+        # 1. Broad Recall
+        candidates_idx = self.tfidf.predict(patient["cond"], top_k=5)
+        
+        scores = []
+        for idx in candidates_idx:
+            row = self.df.iloc[idx]
+            score = 1.0 
+            
+            # Rule-based Filtering
+            if patient["age"] < row["minAge"] or patient["age"] > row["maxAge"]:
+                score = -1.0 # Discard
+            if row["sex"] != "ALL" and row["sex"] != patient["sex"]:
+                score = -1.0 # Discard
+                
+            scores.append((idx, score))
+            
+        # 2. Re-ranking
+        scores.sort(key=lambda x: x[1], reverse=True)
+        final_idx = [x[0] for x in scores if x[1] > 0][:top_k]
+        return final_idx
 
-    for p in patients:
-        print(f"\n=== {p['name']} ===")
-        query_text = p["query_text"]
+# ==========================================
+# 4. Run Experiment
+# ==========================================
 
-        # ---- baseline: TF-IDF only ----
-        tfidf_results = tfidf.query(query_text, top_k=candidate_k)
-        tfidf_indices = [r["index"] for r in tfidf_results]
-        prec_tfidf = precision_at_k(tfidf_indices, df, p, top_k)
-        baseline_scores.append(prec_tfidf)
-        print(f"TF-IDF Precision@{top_k}: {prec_tfidf:.3f}")
+tfidf_model = SimpleTFIDF(df_trials)
+hybrid_model = SimpleHybrid(df_trials, tfidf_model)
+K = 3
 
-        # ---- hybrid: TF-IDF + rules ----
-        hybrid_results = hybrid.query(
-            patient=p,
-            query_text=query_text,
-            top_k=top_k,
-            candidate_k=candidate_k,
-        )
-        hybrid_indices = [r["index"] for r in hybrid_results]
-        prec_hybrid = precision_at_k(hybrid_indices, df, p, top_k)
-        hybrid_scores.append(prec_hybrid)
-        print(f"Hybrid Precision@{top_k}: {prec_hybrid:.3f}")
+pred_flat_tfidf = []
+pred_flat_hybrid = []
 
-        print("\nTop-3 Hybrid Trials:")
-        for r in hybrid_results[:3]:
-            print(f"- {r['nctId']} | {r['briefTitle'][:80]}...")
-            print(f"  tfidf={r['tfidf_score']:.3f}, semantic={r['semantic_score']:.3f}, hybrid={r['hybrid_score']:.3f}")
+for i, p in enumerate(patients_data):
+    recs_tfidf = tfidf_model.predict(p["cond"] + " " + p["desc"], top_k=K)
+    recs_hybrid = hybrid_model.predict(p, top_k=K)
+    
+    for j in range(len(trials_data)):
+        # Check TFIDF
+        if j in recs_tfidf: pred_flat_tfidf.append(1)
+        else: pred_flat_tfidf.append(0)
+            
+        # Check Hybrid
+        if j in recs_hybrid: pred_flat_hybrid.append(1)
+        else: pred_flat_hybrid.append(0)
 
-    if baseline_scores:
-        print("\n=== Average over patients ===")
-        print(f"Avg TF-IDF Precision@{top_k}: {np.mean(baseline_scores):.3f}")
-        print(f"Avg Hybrid Precision@{top_k}: {np.mean(hybrid_scores):.3f}")
+# ==========================================
+# 5. Visualization & Results
+# ==========================================
 
+def plot_confusion_matrix(y_true, y_pred, title, ax):
+    cm = confusion_matrix(y_true, y_pred)
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=False, ax=ax,
+                xticklabels=['Not Rec', 'Rec'], 
+                yticklabels=['Not Rel', 'Rel'])
+    ax.set_title(title)
+    ax.set_ylabel('Ground Truth (Actual)')
+    ax.set_xlabel('Model Prediction')
+    
+    acc = accuracy_score(y_true, y_pred)
+    prec = precision_score(y_true, y_pred, zero_division=0)
+    rec = recall_score(y_true, y_pred, zero_division=0)
+    
+    text = f"Accuracy: {acc:.2f}\nPrecision: {prec:.2f}\nRecall: {rec:.2f}"
+    ax.text(0.5, -0.25, text, ha='center', transform=ax.transAxes, fontweight='bold')
 
-if __name__ == "__main__":
-    run_evaluation()
+fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+plot_confusion_matrix(truth_flat, pred_flat_tfidf, "Baseline: TF-IDF (Text Only)", axes[0])
+plot_confusion_matrix(truth_flat, pred_flat_hybrid, "Proposed: Hybrid Model (Text+Rules)", axes[1])
+
+plt.tight_layout()
+plt.show()
+
+# Print Case Analysis
+print("\n=== Case Analysis Details (5 Patients) ===")
+for i, p in enumerate(patients_data):
+    gt_ids = [t['id'] for t in trials_data if get_ground_truth(p, t) == 1]
+    
+    # Get prediction IDs
+    recs_tfidf_idx = tfidf_model.predict(p["cond"] + " " + p["desc"], top_k=3)
+    recs_tfidf_ids = [trials_data[idx]['id'] for idx in recs_tfidf_idx]
+    
+    recs_hybrid_idx = hybrid_model.predict(p, top_k=3)
+    recs_hybrid_ids = [trials_data[idx]['id'] for idx in recs_hybrid_idx]
+    
+    print(f"\n[Case {p['id']}] {p['desc']}")
+    print(f"  ✅ Ground Truth:   {gt_ids}")
+    print(f"  📊 TF-IDF Recs:    {recs_tfidf_ids}")
+    print(f"  🚀 Hybrid Recs:    {recs_hybrid_ids}")
